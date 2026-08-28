@@ -1,0 +1,17 @@
+UPLOAD INSTRUCTIONS
+
+Extract this ZIP first.
+
+Upload these files DIRECTLY to the main/root of your GitHub repository:
+- app.py
+- Dockerfile
+- requirements.txt
+- render.yaml
+- README.txt
+
+Do NOT upload the containing folder.
+Do NOT rename Dockerfile.
+Do NOT upload only the ZIP to GitHub.
+
+Your GitHub repository main page should show Dockerfile and app.py directly.
+Then redeploy on Render.
