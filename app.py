@@ -8,7 +8,7 @@ from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 import requests, os, re, json, sqlite3, threading, time, csv, io, feedparser
 
-UA={"User-Agent":"CryptoCopilot/40.21 personal research dashboard"}
+UA={"User-Agent":"CryptoCopilot/40.23 personal research dashboard"}
 DB=os.getenv("DB_PATH","market_intel_v421.db")
 CACHE={}
 LOCK=threading.Lock()
@@ -380,6 +380,122 @@ def gdelt():
                 "source":"GDELT DOC 2.0"}
     return cached("gdelt",600,work)
 
+
+# ---------- V40.23 RENDER-RESILIENT FALLBACKS ----------
+# Some public sites rate-limit or block cloud-host IP ranges. These fallbacks
+# use independent public endpoints and never fabricate missing values.
+
+COINBASE_PRODUCTS=["BTC-USD","ETH-USD","SOL-USD","XRP-USD","ADA-USD","DOGE-USD","AVAX-USD","LINK-USD","SUI-USD","DOT-USD","UNI-USD"]
+
+def coinbase_crypto_market():
+    rows=[]
+    for product in COINBASE_PRODUCTS:
+        try:
+            r=http_get(f"https://api.exchange.coinbase.com/products/{product}/stats",
+                       headers={"Accept":"application/json"}, timeout=5)
+            r.raise_for_status(); j=r.json()
+            op=float(j["open"]); last=float(j["last"])
+            rows.append({"symbol":product.replace("-USD","USDT"),
+                         "change":((last/op-1)*100 if op else 0),
+                         "quote_volume":float(j.get("volume",0))*last})
+        except Exception:
+            pass
+    if len(rows)<4:
+        return {"ok":False,"verified":False,"risk_score":None,
+                "summary":"Coinbase fallback insufficient coverage"}
+    btc=next((x for x in rows if x["symbol"]=="BTCUSDT"),rows[0])
+    breadth=100*sum(x["change"]>0 for x in rows)/len(rows)
+    avg=sum(x["change"] for x in rows)/len(rows)
+    risk=50
+    if btc["change"]<-3:risk+=16
+    elif btc["change"]<-1:risk+=8
+    elif btc["change"]>3:risk-=12
+    elif btc["change"]>1:risk-=6
+    if breadth<35:risk+=14
+    elif breadth<48:risk+=6
+    elif breadth>70:risk-=10
+    elif breadth>58:risk-=5
+    if avg<-2:risk+=10
+    elif avg>2:risk-=8
+    return {"ok":True,"verified":True,"risk_score":clamp(risk),
+            "summary":f"BTC {btc['change']:+.2f}% | breadth {breadth:.0f}% | avg {avg:+.2f}%",
+            "details":{"rows":rows,"breadth":breadth,"avg_change":avg,"btc_change":btc["change"]},
+            "source":"Coinbase Exchange public market data"}
+
+_original_crypto_market=crypto_market
+def crypto_market():
+    def work():
+        a=_original_crypto_market()
+        if a.get("verified"): return a
+        b=coinbase_crypto_market()
+        if b.get("verified"): return b
+        return {"ok":False,"verified":False,"risk_score":None,
+                "summary":"Crypto providers unavailable",
+                "details":{"primary_error":a.get("summary"),"coinbase_error":b.get("summary")}}
+    return cached("crypto_v423",30,work)
+
+# Cross-asset composite from two primary official feeds that are already
+# working on the deployed host. It remains useful even if the optional quote
+# snapshot provider is blocked.
+_original_cross_asset_quotes=cross_asset_quotes
+def cross_asset_quotes():
+    def work():
+        q=_original_cross_asset_quotes()
+        if q.get("verified"): return q
+        t=treasury_yields(); v=cboe_vix()
+        vals=[]; parts=[]
+        if t.get("verified") and t.get("risk_score") is not None:
+            vals.append(float(t["risk_score"])); parts.append("Treasury yields")
+        if v.get("verified") and v.get("risk_score") is not None:
+            vals.append(float(v["risk_score"])); parts.append("Cboe VIX")
+        if not vals:
+            return {"ok":False,"verified":False,"risk_score":None,
+                    "summary":"Cross-asset sources unavailable"}
+        return {"ok":True,"verified":True,"risk_score":sum(vals)/len(vals),
+                "summary":" + ".join(parts)+" verified composite",
+                "details":{"treasury":t,"vix":v,"quote_fallback":q},
+                "source":"U.S. Treasury + Cboe official data"}
+    return cached("cross_v423",300,work)
+
+# Render can receive 403 from the BLS calendar page even though BLS API works.
+# FOMC remains official event data. BLS calendar failure is explicitly partial,
+# rather than making the entire event-risk category unavailable.
+_original_bls_calendar=bls_calendar
+def bls_calendar():
+    a=_original_bls_calendar()
+    if a.get("verified"): return a
+    return {"ok":False,"verified":False,"risk_score":None,
+            "summary":"BLS calendar blocked from host; FOMC event monitor remains active",
+            "details":{"error":a.get("summary")},"source":"BLS calendar"}
+
+# News fallback: official Federal Reserve RSS is already reachable from Render.
+# If GDELT is reset/blocked, use verified Fed policy headlines as the news-risk
+# input rather than marking NEWS unavailable.
+_original_gdelt=gdelt
+def gdelt():
+    def work():
+        a=_original_gdelt()
+        if a.get("verified"): return a
+        f=fed_rss()
+        if f.get("verified"):
+            return {"ok":True,"verified":True,"risk_score":f.get("risk_score",50),
+                    "summary":"Global news provider unavailable; official Fed news fallback active",
+                    "details":{"fallback":f,"gdelt_error":a.get("summary")},
+                    "source":"Federal Reserve official RSS fallback"}
+        return a
+    return cached("news_v423",600,work)
+
+# SEC access from cloud IPs can be denied. Do not invent regulation data.
+# When direct SEC is blocked, keep regulation explicitly unavailable; the
+# source-health card explains that it is a host-access restriction.
+_original_sec_crypto=sec_crypto
+def sec_crypto():
+    a=_original_sec_crypto()
+    if a.get("verified"): return a
+    return {"ok":False,"verified":False,"risk_score":None,
+            "summary":"SEC blocks this cloud-host request; regulation receives zero weight",
+            "details":{"error":a.get("summary")},"source":"U.S. SEC"}
+
 # ---------- FUSION ----------
 def fusion():
     inputs={
@@ -414,7 +530,7 @@ def fusion():
     if vix>=78:risk=max(risk,66)
     coverage=den/sum(W.values())
     level="DEFENSIVE" if risk>=75 else "HIGH CAUTION" if risk>=60 else "CAUTION" if risk>=42 else "SUPPORTIVE"
-    out={"ok":True,"version":"40.21","generated_at":now().isoformat(),
+    out={"ok":True,"version":"40.23","generated_at":now().isoformat(),
          "risk_score":round(risk,2),"coverage":round(coverage,3),"level":level,"inputs":inputs,
          "note":"Risk index, not a guaranteed probability. Missing/unverified inputs receive zero weight."}
     save_snapshot(risk,coverage,out)
@@ -425,12 +541,12 @@ async def lifespan(app):
     init_db()
     yield
 
-app=FastAPI(title="Crypto Copilot Intelligence Backend V40.21",lifespan=lifespan)
+app=FastAPI(title="Crypto Copilot Intelligence Backend V40.23",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["GET"],allow_headers=["*"])
 
 @app.get("/health")
 def health():
-    return {"ok":True,"version":"40.21","time_utc":now().isoformat()}
+    return {"ok":True,"version":"40.23","time_utc":now().isoformat()}
 
 @app.get("/api/v1/market-shield")
 def market_shield():
@@ -440,7 +556,7 @@ def market_shield():
 def daily_intelligence():
     p=fusion()
     # Compatible with V40.19/20 frontend categories
-    return {"ok":True,"version":"40.21","generated_at":p["generated_at"],
+    return {"ok":True,"version":"40.23","generated_at":p["generated_at"],
             "risk_score":p["risk_score"],"coverage":p["coverage"],"level":p["level"],
             "inputs":{
                 "macro":p["inputs"]["macro"],
@@ -499,7 +615,7 @@ def cross_asset():
 
 @app.get("/api/v1/config")
 def config():
-    return {"version":"40.21","api_keys_required":False,
-            "primary_no_key_sources":["Binance/CoinGecko","BLS","U.S. Treasury","Cboe VIX",
+    return {"version":"40.23","api_keys_required":False,
+            "primary_no_key_sources":["Binance/CoinGecko/Coinbase fallback","BLS","U.S. Treasury","Cboe VIX",
                                       "Federal Reserve","SEC","GDELT"],
             "secondary_best_effort":["Stooq quote snapshots"]}
